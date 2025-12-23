@@ -181,7 +181,7 @@ def generate_schedule(tasks, tomorrow, blocks,
 # ----------------------------
 # UI state
 # ----------------------------
-st.set_page_config(page_title="To Do List（超簡 MVP）", layout="wide")
+st.set_page_config(page_title="To Do List", layout="wide")
 
 if "tasks" not in st.session_state:
     st.session_state.tasks = []
