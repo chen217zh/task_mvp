@@ -1,0 +1,369 @@
+import streamlit as st
+from datetime import datetime, date, time, timedelta
+from zoneinfo import ZoneInfo
+import uuid
+
+TZ = ZoneInfo("Asia/Taipei")
+
+# ----------------------------
+# Core logic
+# ----------------------------
+def compute_quadrant(task, tomorrow, importance_threshold=4, urgent_days=1):
+    """
+    urgent_days=1: 截止日 <= 明天  算「急」
+    urgent_days=2: 截止日 <= 明天+1 算「急」
+    """
+    important = task["importance"] >= importance_threshold
+
+    due = task["due"]
+    if due is None:
+        urgent = False
+    else:
+        urgent_limit = tomorrow + timedelta(days=max(urgent_days - 1, 0))
+        urgent = due <= urgent_limit
+
+    if important and urgent:
+        return "Q1 重要且急"
+    if important and not urgent:
+        return "Q2 重要不急"
+    if (not important) and urgent:
+        return "Q3 不重要但急"
+    return "Q4 不重要不急"
+
+
+def minutes_between(a_dt, b_dt):
+    return int((b_dt - a_dt).total_seconds() // 60)
+
+
+def dt_on(day: date, t: time):
+    return datetime(day.year, day.month, day.day, t.hour, t.minute, tzinfo=TZ)
+
+
+def generate_schedule(tasks, tomorrow, blocks, importance_threshold=4, urgent_days=1, buffer_ratio=0.2, ensure_q2=1):
+    """
+    最小排程策略（直覺版）：
+    - 只排 todo
+    - 先排 Q1，再保證至少排 ensure_q2 個 Q2，接著 Q2、Q3、Q4
+    - 留 buffer_ratio 緩衝，避免排滿
+    - 排不下的列 overflow
+    """
+    todo = [t for t in tasks if t["status"] == "todo"]
+    if not todo:
+        return [], [], {}, []
+
+    # 可用時間段
+    segments = []
+    for (s_t, e_t) in blocks:
+        s_dt = dt_on(tomorrow, s_t)
+        e_dt = dt_on(tomorrow, e_t)
+        if e_dt > s_dt:
+            segments.append((s_dt, e_dt))
+    if not segments:
+        return [], [], {}, todo
+
+    total_available = sum(minutes_between(s, e) for s, e in segments)
+    sched_limit = int(total_available * (1.0 - max(0.0, min(buffer_ratio, 0.8))))
+
+    # 分類 + 排序 key
+    enriched = []
+    for t in todo:
+        q = compute_quadrant(t, tomorrow, importance_threshold, urgent_days)
+        q_rank = {"Q1 重要且急": 1, "Q2 重要不急": 2, "Q3 不重要但急": 3, "Q4 不重要不急": 4}[q]
+        due_key = t["due"].toordinal() if t["due"] else 10**9  # 沒截止日排後面
+        enriched.append((t, q, q_rank, due_key))
+
+    # 拆四群
+    q1 = [(t, q, d) for (t, q, r, d) in enriched if q.startswith("Q1")]
+    q2 = [(t, q, d) for (t, q, r, d) in enriched if q.startswith("Q2")]
+    q3 = [(t, q, d) for (t, q, r, d) in enriched if q.startswith("Q3")]
+    q4 = [(t, q, d) for (t, q, r, d) in enriched if q.startswith("Q4")]
+
+    # 排序：截止越近越前、重要性高越前
+    q1.sort(key=lambda x: (x[2], -x[0]["importance"]))
+    q2.sort(key=lambda x: (x[2], -x[0]["importance"]))
+    q3.sort(key=lambda x: (x[2], -x[0]["importance"]))
+    q4.sort(key=lambda x: (-x[0]["importance"], x[2]))
+
+    # 保證先排幾個 Q2（避免每天都只在救火）
+    q2_early = q2[:max(0, ensure_q2)]
+    q2_rest = q2[max(0, ensure_q2):]
+
+    ordered = q1 + q2_early + q2_rest + q3 + q4
+
+    # 實際塞進時間段
+    used = 0
+    seg_idx = 0
+    cursor = segments[0][0]
+
+    def move_cursor(si, cur):
+        # 把 cursor 移到可用段內
+        while si < len(segments):
+            s, e = segments[si]
+            if cur < s:
+                cur = s
+            if cur < e:
+                return si, cur
+            si += 1
+            if si < len(segments):
+                cur = segments[si][0]
+        return si, cur
+
+    seg_idx, cursor = move_cursor(seg_idx, cursor)
+
+    schedule = []
+    overflow = []
+
+    for (t, q, _) in ordered:
+        dur = int(t["duration_min"])
+
+        if used + dur > sched_limit:
+            overflow.append(t)
+            continue
+
+        placed = False
+        while seg_idx < len(segments):
+            seg_idx, cursor = move_cursor(seg_idx, cursor)
+            if seg_idx >= len(segments):
+                break
+
+            s, e = segments[seg_idx]
+            remaining = minutes_between(cursor, e)
+            if remaining <= 0:
+                seg_idx += 1
+                continue
+
+            if dur <= remaining:
+                start = cursor
+                end = cursor + timedelta(minutes=dur)
+                cursor = end
+                used += dur
+                schedule.append({
+                    "start": start,
+                    "end": end,
+                    "title": t["title"],
+                    "quadrant": q,
+                    "task_id": t["id"],
+                })
+                placed = True
+                break
+            else:
+                seg_idx += 1
+
+        if not placed:
+            overflow.append(t)
+
+    # 四象限清單
+    quad_map = {"Q1 重要且急": [], "Q2 重要不急": [], "Q3 不重要但急": [], "Q4 不重要不急": []}
+    for (t, q, _, _) in enriched:
+        quad_map[q].append(t)
+
+    meta = {
+        "total_available_min": total_available,
+        "sched_limit_min": sched_limit,
+        "used_min": used
+    }
+    return schedule, quad_map, meta, overflow
+
+
+# ----------------------------
+# UI state
+# ----------------------------
+st.set_page_config(page_title="睡前清單 → 明日行程（超簡 MVP）", layout="wide")
+
+if "tasks" not in st.session_state:
+    st.session_state.tasks = []  # list of dict
+
+today = datetime.now(TZ).date()
+tomorrow = today + timedelta(days=1)
+
+st.title("睡前清單 → 四象限 → 明日行程（超簡 MVP）")
+st.caption("只留最必要：輸入任務、分四象限、排明天時間表。")
+
+# ----------------------------
+# Sidebar: minimal settings
+# ----------------------------
+with st.sidebar:
+    st.subheader("明天可用時間")
+    st.caption("先用預設就好（要更改再改）。")
+
+    en1 = st.checkbox("早段", True)
+    s1 = st.time_input("早段開始", time(9, 0))
+    e1 = st.time_input("早段結束", time(12, 0))
+
+    en2 = st.checkbox("午段", True)
+    s2 = st.time_input("午段開始", time(13, 30))
+    e2 = st.time_input("午段結束", time(18, 0))
+
+    en3 = st.checkbox("晚段", True)
+    s3 = st.time_input("晚段開始", time(20, 0))
+    e3 = st.time_input("晚段結束", time(22, 0))
+
+    blocks = []
+    if en1: blocks.append((s1, e1))
+    if en2: blocks.append((s2, e2))
+    if en3: blocks.append((s3, e3))
+
+    st.divider()
+    st.subheader("分類規則（簡單）")
+    importance_threshold = st.slider("重要性門檻（>= 就算重要）", 1, 5, 4)
+    urgent_days = st.slider("急迫天數（截止 <= 明天+天數-1）", 1, 7, 1)
+
+    st.divider()
+    st.subheader("排程規則（簡單）")
+    buffer_ratio = st.slider("保留緩衝比例", 0.0, 0.5, 0.2, step=0.05)
+    ensure_q2 = st.slider("至少先排幾個 Q2", 0, 5, 1)
+
+    st.divider()
+    if st.button("🧹 清空所有任務", use_container_width=True):
+        st.session_state.tasks = []
+        st.success("已清空。")
+
+    if st.button("✨ 填入範例任務", use_container_width=True):
+        st.session_state.tasks.extend([
+            {"id": str(uuid.uuid4()), "title": "把明天最重要的一件事做 60 分鐘", "duration_min": 60, "importance": 5, "due": None, "status": "todo"},
+            {"id": str(uuid.uuid4()), "title": "回覆兩封信", "duration_min": 30, "importance": 3, "due": tomorrow, "status": "todo"},
+            {"id": str(uuid.uuid4()), "title": "整理桌面/雜事", "duration_min": 30, "importance": 2, "due": None, "status": "todo"},
+        ])
+        st.success("已加入範例。")
+
+
+# ----------------------------
+# Main: Input + List + Plan
+# ----------------------------
+c1, c2 = st.columns([1, 1])
+
+with c1:
+    st.subheader("① 睡前輸入（30 秒）")
+    with st.form("add_task", clear_on_submit=True):
+        title = st.text_input("任務", placeholder="例：寫論文 60 分鐘 / 運動 30 分鐘…")
+        duration_min = st.selectbox("預估時間(分)", [15, 30, 45, 60, 90, 120], index=1)
+        importance = st.slider("重要性(1~5)", 1, 5, 3)
+
+        due_opt = st.selectbox("截止日", ["無", "明天", "自選日期"], index=0)
+        due = None
+        if due_opt == "明天":
+            due = tomorrow
+        elif due_opt == "自選日期":
+            due = st.date_input("選日期", value=tomorrow)
+
+        add = st.form_submit_button("➕ 加入")
+        if add:
+            if not title.strip():
+                st.error("任務不能空白。")
+            else:
+                st.session_state.tasks.append({
+                    "id": str(uuid.uuid4()),
+                    "title": title.strip(),
+                    "duration_min": int(duration_min),
+                    "importance": int(importance),
+                    "due": due,
+                    "status": "todo",
+                })
+                st.success("已加入！")
+
+with c2:
+    st.subheader("② 任務清單（可刪）")
+    tasks = st.session_state.tasks
+
+    if not tasks:
+        st.info("目前沒有任務。先在左邊新增。")
+    else:
+        # 顯示簡單表格
+        table = []
+        for t in tasks:
+            table.append({
+                "任務": t["title"],
+                "時間(分)": t["duration_min"],
+                "重要性": t["importance"],
+                "截止日": t["due"].isoformat() if t["due"] else "",
+                "狀態": t["status"],
+                "id": t["id"],
+            })
+        st.dataframe(
+            [{k: v for k, v in row.items() if k != "id"} for row in table],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # 刪除（最直覺：選一個刪）
+        ids = [row["id"] for row in table]
+        pick = st.selectbox(
+            "選要刪的任務",
+            ids,
+            format_func=lambda x: next(r["任務"] for r in table if r["id"] == x),
+        )
+        if st.button("🗑️ 刪除選取任務", use_container_width=True):
+            st.session_state.tasks = [t for t in st.session_state.tasks if t["id"] != pick]
+            st.success("已刪除。")
+
+st.divider()
+
+st.subheader("③ 一鍵生成：明天行程")
+gen = st.button("🚀 產生明日行程", use_container_width=True)
+
+# 永遠顯示當前分類（就算沒按生成，也看得懂）
+tasks = st.session_state.tasks
+todo = [t for t in tasks if t["status"] == "todo"]
+
+quad_now = {"Q1 重要且急": [], "Q2 重要不急": [], "Q3 不重要但急": [], "Q4 不重要不急": []}
+for t in todo:
+    q = compute_quadrant(t, tomorrow, importance_threshold, urgent_days)
+    quad_now[q].append(t)
+
+qcol1, qcol2, qcol3, qcol4 = st.columns(4)
+for col, qname in zip([qcol1, qcol2, qcol3, qcol4], quad_now.keys()):
+    with col:
+        st.markdown(f"### {qname}")
+        if not quad_now[qname]:
+            st.caption("（空）")
+        else:
+            for t in quad_now[qname]:
+                st.write(f"• {t['title']} ({t['duration_min']}m)")
+
+# 按下生成才做排程表
+if gen:
+    schedule, quad_map, meta, overflow = generate_schedule(
+        tasks=tasks,
+        tomorrow=tomorrow,
+        blocks=blocks,
+        importance_threshold=importance_threshold,
+        urgent_days=urgent_days,
+        buffer_ratio=buffer_ratio,
+        ensure_q2=ensure_q2,
+    )
+
+    st.divider()
+    st.markdown(f"### 🗓️ 明日時間表（{tomorrow.isoformat()}）")
+
+    if not schedule:
+        st.warning("排不出時間表：可能是你沒設定可用時間段，或沒有待辦。")
+    else:
+        rows = []
+        for it in schedule:
+            rows.append({
+                "開始": it["start"].strftime("%H:%M"),
+                "結束": it["end"].strftime("%H:%M"),
+                "任務": it["title"],
+                "象限": it["quadrant"],
+            })
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+        st.caption(
+            f"可用 {meta['total_available_min']} 分｜實排上限 {meta['sched_limit_min']} 分（保留緩衝 {int(buffer_ratio*100)}%）｜已排 {meta['used_min']} 分"
+        )
+
+    if overflow:
+        st.markdown("### ⛔ 排不下（自動延後）")
+        for t in overflow:
+            st.write(f"• {t['title']} ({t['duration_min']}m)")
+
+    # 方便貼到筆記：一鍵輸出純文字
+    plan_lines = [f"明日行程 {tomorrow.isoformat()}"]
+    for it in schedule:
+        plan_lines.append(f"- {it['start'].strftime('%H:%M')}–{it['end'].strftime('%H:%M')} {it['title']} ({it['quadrant']})")
+    if overflow:
+        plan_lines.append("")
+        plan_lines.append("排不下（延後）：")
+        for t in overflow:
+            plan_lines.append(f"- {t['title']} ({t['duration_min']}m)")
+    st.text_area("📌 直接複製貼到筆記", "\n".join(plan_lines), height=220)
